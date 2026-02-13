@@ -1,67 +1,111 @@
 """
-视频帧提取工具
-将视频逐帧拆解，按照 秒_帧.png 格式保存
+图片转频谱音频工具 - 线性频率版本
 """
 
+import numpy as np
 import cv2
-import os
+from scipy.io import wavfile
 from pathlib import Path
 
 
-def extract_frames(video_path: str, output_dir: str):
+def image_to_audio(image_path: str, output_path: str,
+                   sample_rate: int = 192000,
+                   n_fft: int = 4096,
+                   hop_length: int = 512):
     """
-    从视频中提取所有帧
+    将图片转换为频谱对应的音频（线性频率轴）
 
-    Args:
-        video_path: 视频文件路径
-        output_dir: 输出目录路径
+    图片坐标：y=0 (顶部) -> Nyquist, y=height-1 (底部) -> 0 Hz
     """
-    # 创建输出目录
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
 
-    # 打开视频
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"无法打开视频: {video_path}")
-        return
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape
 
-    # 获取视频信息
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    n_freq_bins = n_fft // 2 + 1
+    n_frames = width
 
-    print(f"视频帧率: {fps} FPS")
-    print(f"总帧数: {total_frames}")
-    print(f"开始提取帧...")
+    # 翻转图片（底部=低频，顶部=高频），缩放到 FFT bin 数
+    gray_flipped = np.flipud(gray)
+    magnitude = cv2.resize(gray_flipped, (n_frames, n_freq_bins),
+                           interpolation=cv2.INTER_LINEAR).astype(np.float64) / 255.0
 
-    frame_count = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    # Griffin-Lim
+    np.random.seed(42)
+    phase = np.random.uniform(-np.pi, np.pi, (n_frames, n_freq_bins))
+    window = np.hanning(n_fft)
 
-        # 计算当前秒数和该秒内的帧序号
-        second = int(frame_count // fps)
-        frame_in_second = int(frame_count % fps)
+    for it in range(60):
+        stft = magnitude.T * np.exp(1j * phase)
 
-        # 保存帧，格式: 秒_帧.png
-        filename = f"{second}_{frame_in_second}.png"
-        output_path = os.path.join(output_dir, filename)
-        cv2.imwrite(output_path, frame)
+        # ISTFT
+        output_length = (n_frames - 1) * hop_length + n_fft
+        audio = np.zeros(output_length)
+        window_sum = np.zeros(output_length)
+        for j in range(n_frames):
+            start = j * hop_length
+            frame = np.fft.irfft(stft[j], n_fft)
+            audio[start:start + n_fft] += frame * window
+            window_sum[start:start + n_fft] += window ** 2
+        audio = audio / np.maximum(window_sum, 1e-8)
 
-        frame_count += 1
-        if frame_count % 100 == 0:
-            print(f"已处理: {frame_count}/{total_frames} 帧")
+        # STFT
+        stft_new = np.zeros((n_frames, n_freq_bins), dtype=np.complex128)
+        for j in range(n_frames):
+            start = j * hop_length
+            if start + n_fft <= len(audio):
+                frame = audio[start:start + n_fft] * window
+            else:
+                frame = np.zeros(n_fft)
+                valid = len(audio) - start
+                if valid > 0:
+                    frame[:valid] = audio[start:] * window[:valid]
+            stft_new[j] = np.fft.rfft(frame)
 
-    cap.release()
-    print(f"完成! 共提取 {frame_count} 帧到 {output_dir}")
+        phase = np.angle(stft_new)
+
+    # 最终音频
+    stft = magnitude.T * np.exp(1j * phase)
+    output_length = (n_frames - 1) * hop_length + n_fft
+    audio = np.zeros(output_length)
+    window_sum = np.zeros(output_length)
+    for j in range(n_frames):
+        start = j * hop_length
+        frame = np.fft.irfft(stft[j], n_fft)
+        audio[start:start + n_fft] += frame * window
+        window_sum[start:start + n_fft] += window ** 2
+    audio = audio / np.maximum(window_sum, 1e-8)
+
+    # 归一化并保存
+    audio = audio / np.max(np.abs(audio)) * 0.9
+    wavfile.write(output_path, sample_rate, (audio * 32767).astype(np.int16))
+
+
+def process_task(args):
+    image_to_audio(args[0], args[1])
 
 
 if __name__ == "__main__":
-    # 获取项目根目录
-    script_dir = Path(__file__).parent
-    project_root = script_dir.parent
+    from tqdm import tqdm
+    from concurrent.futures import ProcessPoolExecutor
+    import os
 
-    video_path = project_root / "raw_video" / "1.mp4"
-    output_dir = project_root / "analyzed_image"
+    project_root = Path(__file__).parent.parent
+    input_dir = project_root / "analyzed_image"
+    output_dir = project_root / "output_audio"
+    output_dir.mkdir(exist_ok=True)
 
-    extract_frames(str(video_path), str(output_dir))
+    images = sorted(input_dir.glob("*.png"))
+    print(f"找到 {len(images)} 张图片")
+
+    # 准备任务列表
+    tasks = [(str(img), str(output_dir / f"{img.stem}.wav")) for img in images]
+
+    # 使用 12 个进程（保留 4 核给系统）
+    num_workers = min(12, os.cpu_count() - 8)
+    print(f"使用 {num_workers} 个进程并行处理")
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        list(tqdm(executor.map(process_task, tasks), total=len(tasks), desc="转换进度"))
