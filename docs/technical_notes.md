@@ -7,7 +7,7 @@
 ## 处理流程
 
 ```
-视频 -> 逐帧图片 -> 频谱音频 -> 合并
+视频 -> 逐帧图片 -> 频谱音频 -> 获得频谱图片 -> 合成视频
 ```
 
 ### 1. 视频拆帧
@@ -48,6 +48,9 @@
 
 用的 librosa 的实现，32 次迭代，比手写的快很多。
 
+当然了，这并不会让频谱更好看，只是我的一点恶趣味
+
+
 ### 3. 并行处理
 
 图片转音频是 CPU 密集型的，用 ProcessPoolExecutor 多进程并行。每张图片独立处理，没有依赖关系。
@@ -58,8 +61,25 @@
 raw_video/          原始视频
 analyzed_image/     拆出来的帧
 output_audio/       生成的音频片段
+output_spectrum/    频谱分析图
 toolbox/            处理脚本
 ```
+
+### 4. 频谱分析
+
+`toolbox/analyze_spectrum.py` - 单文件分析
+`toolbox/batch_spectrum.py` - 批量分析
+
+用于验证生成的音频是否正确还原了图像。输出双子图：
+- 上方：时域波形
+- 下方：时频谱图（线性频率轴）
+
+参数与 image_to_audio 保持一致：
+- nperseg = 4096
+- hop_length = 512
+- noverlap = nperseg - hop_length
+
+批量处理使用 ProcessPoolExecutor，默认 6 进程并行。标签使用英文以避免跨平台字体问题。
 
 ## 依赖
 

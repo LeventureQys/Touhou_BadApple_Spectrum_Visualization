@@ -4,3 +4,6 @@
 outputs.zip
 /outputs/output_audio
 /outputs
+/output_spectrum
+*.mp4
+output_spectrum.zip
